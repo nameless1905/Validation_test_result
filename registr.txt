@@ -1,0 +1,23 @@
+
+
+. Расширяем раздел и ФС внутри Ubuntu
+
+После увеличения файла диска гостевая ОС видит больше нераспределённого места, но раздел и ФС остаются старого размера. Дальше два случая:
+
+Если используется LVM (стандартно для Ubuntu Server):
+
+bash
+sudo apt install cloud-guest-utils   # для growpart
+sudo growpart /dev/sda 3             # расширить нужный раздел (номер уточните через lsblk)
+sudo pvresize /dev/sda3
+sudo lvextend -l +100%FREE /dev/mapper/ubuntu--vg-ubuntu--lv
+sudo resize2fs /dev/mapper/ubuntu--vg-ubuntu--lv   # для ext4
+# или для xfs: sudo xfs_growfs /
+
+Если простой раздел без LVM (часто в Desktop-версии):
+
+bash
+sudo growpart /dev/sda 1
+sudo resize2fs /dev/sda1
+
+Проще всего разобраться, что у вас, командой lsblk и df -h — покажите вывод, если что-то непонятно, помогу подставить точные имена устройств.

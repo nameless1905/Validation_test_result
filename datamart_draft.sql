@@ -19,7 +19,10 @@ CREATE SCHEMA IF NOT EXISTS mart;
 CREATE TABLE IF NOT EXISTS mart.pseudonymization_config (
     salt_value text NOT NULL
 );
--- INSERT INTO mart.pseudonymization_config VALUES ('ЗАМЕНИТЬ_НА_РЕАЛЬНУЮ_СОЛЬ');
+
+SELECT encode(gen_random_bytes(32), 'hex');
+INSERT INTO mart.pseudonymization_config VALUES ('bc7b923149461aec845d9edcb754dd2f221cfb31d3522f2015722bd47492a59c');
+
 
 
 -- =====================================================================
@@ -121,32 +124,130 @@ WHERE rl.deleted = false
 ON CONFLICT (reagentlot_id) DO NOTHING;
 
 
--- =====================================================================
--- 2. ПСЕВДОНИМИЗИРОВАННЫЙ РЕЕСТР ПАЦИЕНТОВ
--- =====================================================================
-CREATE TABLE IF NOT EXISTS mart.dim_patient (
-    patient_id             uuid PRIMARY KEY,      -- внутри защищённого контура, для join
-    patient_pseudo_id        text UNIQUE NOT NULL,  -- то, что уходит во внешний/ML-датасет
-    birthdate                  date,
-    age_years_snapshot            integer,          -- TODO: пересчитывать на момент результата, а не статично
-    gender_code                    integer,
-    sex_normalized                    text            -- TODO: расшифровать gender через enum-справочник
-);
 
-INSERT INTO mart.dim_patient (patient_id, patient_pseudo_id, birthdate, gender_code)
+
+
+DROP TABLE IF EXISTS mart.dim_patient CASCADE;
+ 
+CREATE TABLE mart.dim_patient (
+    patient_pseudo_id      text PRIMARY KEY,
+    natural_key_hash          text NOT NULL,   -- технический ключ дедупликации, для внутренней сверки
+    order_ids                    uuid[] NOT NULL,  -- ВСЕ orders.id, схлопнувшиеся в этого пациента
+    birthdate                       date,
+    sex_normalized                    text,
+    orders_matched_count                 integer NOT NULL,
+    needs_manual_review                     boolean DEFAULT false,  -- см. пояснение по порогу ниже
+    created_at                                  timestamp DEFAULT now()
+);
+ 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_dim_patient_natural_key ON mart.dim_patient (natural_key_hash);
+CREATE INDEX IF NOT EXISTS idx_dim_patient_order_ids ON mart.dim_patient USING gin (order_ids);
+ 
+ 
+-- =====================================================================
+-- ЗАПОЛНЕНИЕ — дедупликация всех orders по естественному ключу (ФИО+ДР)
+-- =====================================================================
+ 
+WITH normalized_orders AS (
+    SELECT
+        o.id AS order_id,
+        lower(trim(o.firstname))                 AS fn,
+        lower(trim(o.lastname))                    AS ln,
+        lower(trim(coalesce(o.middlename, '')))      AS mn,
+        o.birthdate::date                              AS bd,
+        o.sex                                            AS sex_raw
+    FROM public.orders o
+    WHERE o.deleted = false
+      AND o.firstname IS NOT NULL
+      AND o.lastname IS NOT NULL
+      AND o.birthdate IS NOT NULL   -- без даты рождения естественный ключ ненадёжен, такие заказы исключаем
+),
+grouped AS (
+    SELECT
+        fn, ln, mn, bd,
+        mode() WITHIN GROUP (ORDER BY sex_raw) AS sex_mode,
+        array_agg(order_id ORDER BY order_id) AS order_ids,
+        count(*) AS orders_matched_count
+    FROM normalized_orders
+    GROUP BY fn, ln, mn, bd
+)
+INSERT INTO mart.dim_patient (
+    patient_pseudo_id, natural_key_hash, order_ids,
+    birthdate, sex_normalized, orders_matched_count, needs_manual_review
+)
 SELECT
-    p.id,
-    'p_' || substr(encode(digest(p.id::text || (SELECT salt_value FROM mart.pseudonymization_config LIMIT 1), 'sha256'), 'hex'), 1, 12),
-    p.birthdate::date,
-    p.gender
-FROM public.patients p
-WHERE p.deleted = false
-ON CONFLICT (patient_id) DO NOTHING;
+    'p_' || substr(
+        encode(
+            digest(
+                fn || '|' || ln || '|' || mn || '|' || bd::text
+                || (SELECT salt_value FROM mart.pseudonymization_config LIMIT 1),
+                'sha256'
+            ),
+            'hex'
+        ), 1, 12
+    ) AS patient_pseudo_id,
+    encode(digest(fn || '|' || ln || '|' || mn || '|' || bd::text, 'sha256'), 'hex') AS natural_key_hash,
+    order_ids,
+    bd,
+    sex_mode::text,   -- TODO: расшифровать через enum-справочник вместо сырого кода
+    orders_matched_count,
+    -- Флаг НЕ означает "что-то не так" сам по себе — множественные заказы это
+    -- норма (повторные визиты). Это эвристика для приоритизации выборочной
+    -- ручной проверки на предмет ложного схлопывания РАЗНЫХ людей с
+    -- одинаковыми ФИО+ДР. Порог 15 — начальный, подберите по факту
+    -- распределения (см. диагностику ниже).
+    orders_matched_count > 15
+FROM grouped
+ON CONFLICT (natural_key_hash) DO NOTHING;
+ 
+
+
+
+
+
+-- =====================================================================
+-- Связка таблицы фактов с dim_patient через orders
+-- =====================================================================
+ 
+-- =====================================================================
+-- 1. Мостовая таблица: order_id -> patient_pseudo_id
+-- Разворачиваем order_ids[] из dim_patient в обычные строки с
+-- обычным индексируемым uuid. Это на порядок быстрее прямого join'а
+-- через ANY(order_ids)/@> при таком объёме данных (10М заказов).
+-- =====================================================================
+ 
+DROP TABLE IF EXISTS mart.patient_order_map;
+ 
+CREATE TABLE mart.patient_order_map (
+    order_id           uuid PRIMARY KEY,
+    patient_pseudo_id    text NOT NULL REFERENCES mart.dim_patient (patient_pseudo_id)
+);
+ 
+INSERT INTO mart.patient_order_map (order_id, patient_pseudo_id)
+SELECT
+    unnest(dp.order_ids) AS order_id,
+    dp.patient_pseudo_id
+FROM mart.dim_patient dp;
+ 
+CREATE INDEX IF NOT EXISTS idx_patient_order_map_pseudo ON mart.patient_order_map (patient_pseudo_id);
+ 
+-- Проверка: количество строк моста должно совпадать с суммой orders_matched_count в dim_patient
+SELECT
+    (SELECT count(*) FROM mart.patient_order_map) AS map_rows,
+    (SELECT sum(orders_matched_count) FROM mart.dim_patient) AS expected_rows;
+ 
+ 
+
+
 
 
 -- =====================================================================
 -- 3. ТАБЛИЦА ФАКТОВ — один результат-показатель на строку (сырой уровень)
 -- =====================================================================
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+
 CREATE TABLE IF NOT EXISTS mart.fact_measurement_raw (
     id                    uuid DEFAULT uuid_generate_v1() PRIMARY KEY,
     measurecontext_id       uuid,               -- ссылка на источник (внутри контура)
@@ -160,8 +261,8 @@ CREATE TABLE IF NOT EXISTS mart.fact_measurement_raw (
     assay_standardcode              text,
 
     parametr_name                   text,
-
-    value                                double precision,
+    
+    value                           double precision,
 
     unit                                  text,
     ref_min                                double precision,
@@ -181,22 +282,29 @@ CREATE TABLE IF NOT EXISTS mart.fact_measurement_raw (
 -- ETL-заполнение сырого уровня фактов
 -- TODO: заменить фильтр по assay.code на реальные коды вашей CBC-панели
 INSERT INTO mart.fact_measurement_raw (
-    measurecontext_id, orderline_id, sample_id, order_id, patient_pseudo_id,
-    measureparameter_id, normalized_code, value, unit, ref_min, ref_max, flag,
-    resultrefcharstatus_raw, was_entered_manually, collected_at, method_id, analyser_id, reagentlot_id
+    measurecontext_id, orderline_id, order_id, patient_pseudo_id,
+    measureparameter_id,  assay_id , assay_name, assay_standardcode, parametr_name,value, unit,ref_min, ref_max, flag,           -- 'L'/'H'/NULL, из lessflag/moreflag
+    resultrefcharstatus_raw,       
+    was_entered_manually ,
+    
+    method_id  ,
+    method_name  ,
+    analyser_id    ,
+    analyser_name 
+    
 )
 SELECT
     mc.id,
     ol.id,
     
     o.id,
-    dp.patient_pseudo_id,
+    pat.patient_pseudo_id,
     mc.measureparameter_id,
     a.id,
     a.name,
-    a.standardcode
+    a.standardcode,
 
-    dmp.name
+    dmp.name,
     
     mc.numericvalue,
     munit.name,
@@ -211,18 +319,20 @@ SELECT
     mc.wasenteredmanually,
    
     mc.method_id,
-    mth.name
+    mth.name,
     mth.analyser_id,
     an.name  -- TODO: связать конкретный лот (reagentlots), а не только reagent_id — нужна доп. логика выбора активного лота на дату
 FROM public.measurecontext mc
 JOIN public.orderline ol       ON ol.id = mc.measureorderline_id
 
 JOIN public.orders o             ON o.id = ol.order_id
-JOIN mart.dim_patient dp          ON dp.patient_id = o.patient_id
+left join mart.patient_order_map pat  on pat.order_id = o.id
+
 JOIN public.assay a                ON a.id = ol.assay_id
-LEFT JOIN pablic.measureparameter dmp ON dmp.measureparameter_id = mc.measureparameter_id
-LEFT JOIN pablic.measuringunits munit ON dmp.measuringunit_id = munit.id
-LEFT JOIN  pablic.method mth ON mth.method_id = mc.method_id
+LEFT JOIN public.measureparameter dmp ON dmp.id = mc.measureparameter_id
+LEFT JOIN public.measuringunits munit ON dmp.measuringunit_id = munit.id
+LEFT JOIN  public.method mth ON mth.id = mc.method_id
+left join public.analyser an on an.id = mth.analyser_id
 WHERE mc.deleted IS NOT TRUE  -- TODO: проверить, есть ли столбец deleted у measurecontext в вашей версии
  
 

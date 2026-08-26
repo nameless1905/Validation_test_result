@@ -8,6 +8,7 @@
 -- Для хэширования при псевдонимизации (digest/hmac)
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+
 CREATE SCHEMA IF NOT EXISTS mart;
 
 -- =====================================================================
@@ -150,22 +151,30 @@ CREATE TABLE IF NOT EXISTS mart.fact_measurement_raw (
     id                    uuid DEFAULT uuid_generate_v1() PRIMARY KEY,
     measurecontext_id       uuid,               -- ссылка на источник (внутри контура)
     orderline_id              uuid,
-    sample_id                   uuid,
+                     
     order_id                     uuid,
     patient_pseudo_id              text,
     measureparameter_id             uuid,
-    normalized_code                    text,
+    assay_id                        uuid,
+    assay_name                      text,
+    assay_standardcode              text,
+
+    parametr_name                   text,
+
     value                                double precision,
+
     unit                                  text,
     ref_min                                double precision,
     ref_max                                 double precision,
     flag                                     text,           -- 'L'/'H'/NULL, из lessflag/moreflag
     resultrefcharstatus_raw                    integer,       -- TODO: расшифровать через enum-таблицы
     was_entered_manually                         boolean,
-    collected_at                                   timestamp,
+    
     method_id                                        uuid,
+    method_name                                        text,
     analyser_id                                        uuid,
-    reagentlot_id                                        uuid,
+    analyser_name                                      text,
+    
     created_at                                              timestamp DEFAULT now()
 );
 
@@ -179,13 +188,18 @@ INSERT INTO mart.fact_measurement_raw (
 SELECT
     mc.id,
     ol.id,
-    s.id,
+    
     o.id,
     dp.patient_pseudo_id,
     mc.measureparameter_id,
-    dmp.normalized_code,
+    a.id,
+    a.name,
+    a.standardcode
+
+    dmp.name
+    
     mc.numericvalue,
-    dmp.measuringunit_name,
+    munit.name,
     mc.normalminvalue,
     mc.normalmaxvalue,
     CASE
@@ -195,21 +209,22 @@ SELECT
     END AS flag,
     mc.resultrefcharstatus,
     mc.wasenteredmanually,
-    s.samplingtimestamp,
+   
     mc.method_id,
+    mth.name
     mth.analyser_id,
-    mth.reagent_id   -- TODO: связать конкретный лот (reagentlots), а не только reagent_id — нужна доп. логика выбора активного лота на дату
+    an.name  -- TODO: связать конкретный лот (reagentlots), а не только reagent_id — нужна доп. логика выбора активного лота на дату
 FROM public.measurecontext mc
 JOIN public.orderline ol       ON ol.id = mc.measureorderline_id
-JOIN public.sample s            ON s.id = ol.sample_id
+
 JOIN public.orders o             ON o.id = ol.order_id
 JOIN mart.dim_patient dp          ON dp.patient_id = o.patient_id
 JOIN public.assay a                ON a.id = ol.assay_id
-LEFT JOIN mart.dim_measureparameter dmp ON dmp.measureparameter_id = mc.measureparameter_id
-LEFT JOIN mart.dim_method_thresholds mth ON mth.method_id = mc.method_id
+LEFT JOIN pablic.measureparameter dmp ON dmp.measureparameter_id = mc.measureparameter_id
+LEFT JOIN pablic.measuringunits munit ON dmp.measuringunit_id = munit.id
+LEFT JOIN  pablic.method mth ON mth.method_id = mc.method_id
 WHERE mc.deleted IS NOT TRUE  -- TODO: проверить, есть ли столбец deleted у measurecontext в вашей версии
-  AND a.code IN ('PLACEHOLDER_CBC_ASSAY_CODE')  -- TODO: подставить реальные коды ОАК из вашей assay
-  AND s.samplingtimestamp IS NOT NULL;
+ 
 
 
 -- =====================================================================

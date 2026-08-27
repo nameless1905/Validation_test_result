@@ -344,39 +344,53 @@ CREATE TABLE IF NOT EXISTS mart.fact_cbc_case (
     case_id              uuid DEFAULT uuid_generate_v1() PRIMARY KEY,
     order_id                uuid,
     orderline_id               uuid,
-    sample_id                     uuid,
+    
     patient_pseudo_id                text,
     collected_at                        timestamp,
     age_years                             integer,
     sex                                     text,
     analyzer_model                          text,
-    reagentlot_hash                            text,
+    assay_name                      text,
+    assay_standardcode              text,
+    method_name						text,
+
     indices_json                                 jsonb,     -- агрегированные показатели одним объектом
-    rule_verdict                                    text,     -- из orderline.state (после расшифровки)
-    rule_alert_flag                                    boolean,
-    rule_alert_message_raw                                text,
+  
     created_at                                              timestamp DEFAULT now()
 );
 
 -- ETL: агрегация нескольких строк fact_measurement_raw в один JSON-объект на кейс
 INSERT INTO mart.fact_cbc_case (
-    case_id, order_id, orderline_id, sample_id, patient_pseudo_id, collected_at,
-    age_years, sex, analyzer_model, reagentlot_hash, indices_json,
-    rule_verdict, rule_alert_flag, rule_alert_message_raw
+    case_id         ,
+    order_id                ,
+    orderline_id              ,
+    
+    patient_pseudo_id                ,
+    collected_at                        ,
+    age_years                             ,
+    sex                                     ,
+    analyzer_model                          ,
+    assay_name                      ,
+    assay_standardcode              ,
+    method_name						,
+
+    indices_json       
 )
 SELECT
     uuid_generate_v1(),
     fr.order_id,
     fr.orderline_id,
-    fr.sample_id,
+    
     fr.patient_pseudo_id,
     fr.collected_at,
-    dp.age_years_snapshot,   -- TODO: пересчитать возраст на collected_at, а не брать статичный снапшот
+    date_part('year', age(ol.completiontimestamp, dp.birthdate))::integer AS age_years,   
     dp.sex_normalized,
-    da.normalized_model,
-    drl.lotnumber_hash,
+    fr.analyzer_name,
+    fr.assay_name,
+    fr.assay_standardcode,
+    fr.method_name
     jsonb_object_agg(
-        fr.normalized_code,
+        
         jsonb_build_object(
             'value', fr.value,
             'unit', fr.unit,
@@ -384,18 +398,23 @@ SELECT
             'flag', fr.flag
         )
     ) AS indices_json,
-    ol.state::text,          -- TODO: заменить на расшифрованный текстовый вердикт через enum-справочник
-    ol.alert,
-    ol.alertmessage
+  
 FROM mart.fact_measurement_raw fr
 JOIN public.orderline ol   ON ol.id = fr.orderline_id
 LEFT JOIN mart.dim_patient dp ON dp.patient_pseudo_id = fr.patient_pseudo_id
-LEFT JOIN mart.dim_analyzer da ON da.analyser_id = fr.analyser_id
-LEFT JOIN mart.dim_reagent_lot drl ON drl.reagentlot_id = fr.reagentlot_id
+
 GROUP BY
-    fr.order_id, fr.orderline_id, fr.sample_id, fr.patient_pseudo_id, fr.collected_at,
-    dp.age_years_snapshot, dp.sex_normalized, da.normalized_model, drl.lotnumber_hash,
-    ol.state, ol.alert, ol.alertmessage;
+    fr.order_id,
+    fr.orderline_id,
+    
+    fr.patient_pseudo_id,
+    fr.collected_at,
+    age_years,   
+    dp.sex_normalized,
+    fr.analyzer_name,
+    fr.assay_name,
+    fr.assay_standardcode,
+    fr.method_name;
 
 
 -- =====================================================================

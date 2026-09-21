@@ -420,7 +420,7 @@ GROUP BY
 -- =====================================================================
 -- 5. ИСТОРИЯ И ДЕЛЬТА-ЧЕК (предрасчитанные, отдельная таблица)
 -- =====================================================================
-CREATE TABLE IF NOT EXISTS mart.fact_patient_history (
+CREATE TABLE IF NOT EXISTS mart.fact_patient_history_2026 (
     case_id             uuid REFERENCES mart.fact_cbc_case(case_id),
     historical_results     jsonb,   -- последние N результатов по пациенту (до текущего collected_at)
     delta_check                jsonb    -- {"WBC_delta_pct": ..., "PLT_delta_pct": ...}
@@ -432,7 +432,15 @@ CREATE TABLE IF NOT EXISTS mart.fact_patient_history (
 -- проверить производительность на реальном объёме данных, при необходимости
 -- переписать через оконные функции (LAG) по предварительно развёрнутой таблице.
 
-INSERT INTO mart.fact_patient_history (case_id, historical_results, delta_check)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_fact_cbc_case_2026_patient_time
+    ON mart.fact_cbc_case_2026 (patient_pseudo_id, collected_at DESC);
+
+
+ANALYZE mart.fact_cbc_case_2026;
+
+
+EXPLAIN
+INSERT INTO mart.fact_patient_history_2026 (case_id, historical_results, delta_check)
 SELECT
     fc.case_id,
     (
@@ -442,7 +450,7 @@ SELECT
                        'collected_at', prev.collected_at,
                        'indices', prev.indices_json
                    ) AS h
-            FROM mart.fact_cbc_case prev
+            FROM mart.fact_cbc_case_2026 prev
             WHERE prev.patient_pseudo_id = fc.patient_pseudo_id
               AND prev.collected_at < fc.collected_at
             ORDER BY prev.collected_at DESC
@@ -463,7 +471,7 @@ SELECT
             FROM jsonb_object_keys(fc.indices_json) AS key
             CROSS JOIN LATERAL (
                 SELECT prev.indices_json
-                FROM mart.fact_cbc_case prev
+                FROM mart.fact_cbc_case_2026 prev
                 WHERE prev.patient_pseudo_id = fc.patient_pseudo_id
                   AND prev.collected_at < fc.collected_at
                 ORDER BY prev.collected_at DESC
@@ -472,30 +480,95 @@ SELECT
             WHERE last_val.indices_json ? key
         ) deltas
     ) AS delta_check
-FROM mart.fact_cbc_case fc
+FROM mart.fact_cbc_case_2026 fc
 ON CONFLICT DO NOTHING;
+
+
+
+
+-- Проблема исходного варианта: на КАЖДУЮ строку fc выполнялось ДВА
+-- независимых обращения к fact_cbc_case_2026 —
+--   (a) topN=5 для historical_results,
+--   (b) top1 внутри LATERAL, который PostgreSQL, вероятнее всего,
+--       пересчитывал заново для КАЖДОГО ключа jsonb_object_keys(fc.indices_json)
+--       (т.к. LATERAL стоит внутри подзапроса, коррелированного по key).
+-- То есть на строку с ~25 показателями CBC могло уходить не 2, а ~27
+-- обращений к таблице.
+--
+-- Решение: один CROSS JOIN LATERAL на строку fc, который одним проходом
+-- отдаёт и массив последних 5 результатов (historical_results), и JSON
+-- последнего результата (last_indices_json), из которого затем считается
+-- delta_check без повторного похода в таблицу.
+-- =====================================================================
+ 
+INSERT INTO mart.fact_patient_history_2026 (case_id, historical_results, delta_check)
+SELECT
+    fc.case_id,
+    hist.historical_results,
+    (
+        SELECT jsonb_object_agg(key || '_delta_pct', delta_pct)
+        FROM (
+            SELECT
+                key,
+                ROUND(
+                    ((fc.indices_json -> key ->> 'value')::numeric
+                     - (hist.last_indices_json -> key ->> 'value')::numeric)
+                    / NULLIF((hist.last_indices_json -> key ->> 'value')::numeric, 0) * 100,
+                    1
+                ) AS delta_pct
+            FROM jsonb_object_keys(fc.indices_json) AS key
+            WHERE hist.last_indices_json ? key
+              -- защита от деления при нечисловых/пустых значениях
+              AND (fc.indices_json -> key ->> 'value') ~ '^-?\d+(\.\d+)?$'
+              AND (hist.last_indices_json -> key ->> 'value') ~ '^-?\d+(\.\d+)?$'
+        ) deltas
+    ) AS delta_check
+FROM mart.fact_cbc_case_2026 fc
+CROSS JOIN LATERAL (
+    SELECT
+        jsonb_agg(
+            jsonb_build_object('collected_at', t.collected_at, 'indices', t.indices_json)
+            ORDER BY t.collected_at DESC
+        ) AS historical_results,
+        (array_agg(t.indices_json ORDER BY t.collected_at DESC))[1] AS last_indices_json
+    FROM (
+        SELECT prev.collected_at, prev.indices_json
+        FROM mart.fact_cbc_case_2026 prev
+        WHERE prev.patient_pseudo_id = fc.patient_pseudo_id
+          AND prev.collected_at < fc.collected_at
+        ORDER BY prev.collected_at DESC
+        LIMIT 5
+    ) t
+) hist
+WHERE hist.historical_results IS NOT NULL   -- пропускаем случаи без истории вообще
+ON CONFLICT DO NOTHING;
+
+
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_fact_patient_history_2026_case
+    ON  mart.fact_patient_history_2026 (case_id);
 
 
 -- =====================================================================
 -- 6. ИТОГОВОЕ ПРЕДСТАВЛЕНИЕ — готовый вид для выгрузки в ML-датасет
 -- =====================================================================
-CREATE OR REPLACE VIEW mart.v_ml_case_export AS
+CREATE OR REPLACE VIEW mart.v_ml_case_export_2026 AS
 SELECT
     fc.case_id,
+    fc.order_id,
+    fc.orderline_id,
     fc.collected_at,
     fc.patient_pseudo_id,
     fc.age_years,
     fc.sex,
-    fc.analyzer_model,
-    fc.reagentlot_hash,
+    fc.assay_name,
+    fc.assay_standardcode,
     fc.indices_json,
-    fc.rule_verdict,
-    fc.rule_alert_flag,
-    fc.rule_alert_message_raw,
+    
     ph.historical_results,
     ph.delta_check
-FROM mart.fact_cbc_case fc
-LEFT JOIN mart.fact_patient_history ph ON ph.case_id = fc.case_id;
+FROM mart.fact_cbc_case_2026 fc
+LEFT JOIN mart.fact_patient_history_2026 ph ON ph.case_id = fc.case_id;
 
 -- Пример выгрузки одного кейса в формате, близком к целевой схеме case:
 -- SELECT row_to_json(v) FROM mart.v_ml_case_export v WHERE case_id = '...';

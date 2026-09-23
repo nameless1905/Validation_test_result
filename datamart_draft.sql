@@ -383,17 +383,23 @@ SELECT
     
     fr.patient_pseudo_id,
     fr.collected_at,
-    date_part('year', age(ol.completiontimestamp, dp.birthdate))::integer AS age_years,   
+      CASE
+        WHEN dp.birthdate IS NULL OR ol.completiontimestamp IS NULL THEN NULL
+        WHEN date_part('year', age(ol.completiontimestamp, dp.birthdate)) NOT BETWEEN 0 AND 120 THEN NULL
+        ELSE date_part('year', age(ol.completiontimestamp, dp.birthdate))::integer
+    END AS age_years,  
     dp.sex_normalized,
-    fr.analyzer_name,
+    
     fr.assay_name,
     fr.assay_standardcode,
-    fr.method_name
+    
     jsonb_object_agg(
         
         jsonb_build_object(
             'value', fr.value,
             'unit', fr.unit,
+            'method',fr.method_name,
+            'analyzer',fr.analyzer_name,
             'ref_range', jsonb_build_array(fr.ref_min, fr.ref_max),
             'flag', fr.flag
         )
@@ -411,10 +417,10 @@ GROUP BY
     fr.collected_at,
     age_years,   
     dp.sex_normalized,
-    fr.analyzer_name,
+    
     fr.assay_name,
     fr.assay_standardcode,
-    fr.method_name;
+    
 
 
 -- =====================================================================
